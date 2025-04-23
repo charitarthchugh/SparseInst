@@ -271,6 +271,27 @@ def setup(args):
 def main(args):
     cfg = setup(args)
 
+    # --- W&B Integration Start ---
+    if comm.is_main_process():
+        # Initialize wandb run
+        # Make sure to set your project name and optionally entity
+        # Remove project and entity args if you want to use defaults or environment variables
+        run = wandb.init(
+            project="your-detectron2-project",  # Replace with your project name
+            # entity="your-wandb-entity",    # Optional: replace with your W&B entity (username or team)
+            sync_tensorboard=True,       # Auto-sync TensorBoard metrics
+            config=cfg,                  # Log Detectron2 config
+            name=f"run-{cfg.OUTPUT_DIR.split('/')[-1]}", # Optional: set a run name
+            resume="allow",              # Allow resuming runs
+            # group="experiment-group",   # Optional: Group runs together
+            # job_type="training",        # Optional: Categorize the run
+        )
+        # Optional: Define metrics for better W&B dashboard visualization
+        # wandb.define_metric("train/total_loss", summary="min")
+        # wandb.define_metric("validation/coco_eval/bbox/AP", summary="max")
+    # --- W&B Integration End ---
+
+
     if args.eval_only:
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
@@ -278,16 +299,30 @@ def main(args):
         res = Trainer.test(cfg, model)
         if comm.is_main_process():
             verify_results(cfg, res)
+        # --- W&B Integration: Finish run after eval ---
+        if comm.is_main_process():
+            if run: run.finish()
+        # --- End W&B ---
         return res
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
-    return trainer.train()
+    res = trainer.train()
+
+    # --- W&B Integration: Finish run after training ---
+    if comm.is_main_process():
+        if run: run.finish()
+    # --- End W&B ---
+    return res
 
 
 if __name__ == "__main__":
     args = default_argument_parser().parse_args()
     print("Command Line Args:", args)
+    # Ensure wandb is disabled in non-main processes launched by detectron2's launch util
+    if not comm.is_main_process():
+        os.environ["WANDB_DISABLED"] = "true"
+
     launch(
         main,
         args.num_gpus,

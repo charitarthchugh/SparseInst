@@ -28,7 +28,112 @@ sys.path.append(".")
 from sparseinst import add_sparse_inst_config, COCOMaskEvaluator
 
 
+
+import time # Make sure this import is present
+from detectron2.utils.events import get_event_storage # Make sure this import is present
+
 class Trainer(DefaultTrainer):
+
+    def __init__(self, cfg):
+        """
+        Args:
+            cfg (CfgNode):
+        """
+        super().__init__(cfg)
+        # Get gradient accumulation steps from config, default to 1 (no accumulation)
+        self.grad_accum_steps = cfg.SOLVER.get('GRADIENT_ACCUMULATION_STEPS', 1)
+        if self.grad_accum_steps > 1:
+            # Ensure gradients are zeroed before the first training iteration
+            self.optimizer.zero_grad()
+            if comm.is_main_process():
+                print(f"Gradient accumulation enabled: Will accumulate gradients over {self.grad_accum_steps} steps.")
+
+    def _call_hooks(self, hook_name):
+        """
+        Helper method to call registered hooks. Replicates logic from SimpleTrainer.
+        """
+        for h in self._hooks:
+            # Use getattr to call the hook method if it exists
+            hook_method = getattr(h, hook_name, None)
+            if callable(hook_method):
+                hook_method(self) # Pass trainer instance to hook method
+
+    def run_step(self):
+        """
+        Implement the standard training logic with gradient accumulation.
+        Overrides DefaultTrainer.run_step.
+        """
+        assert self.model.training, "[Trainer] model was changed to eval mode!"
+        start = time.perf_counter()
+
+        # Get data
+        data = next(self._data_loader_iter)
+        data_time = time.perf_counter() - start
+
+        # === Hooks: before_step ===
+        storage = get_event_storage()
+        # Ensure storage iteration is aligned with trainer iteration
+        storage.iter = self.iter
+        self._call_hooks("before_step")
+        # ==========================
+
+        # Forward pass
+        loss_dict = self.model(data)
+        losses = sum(loss_dict.values())
+
+        # Check for invalid losses
+        if not torch.isfinite(losses):
+            raise FloatingPointError(
+                "Loss became infinite or NaN at iteration={}!\nLosses: {}".format(
+                    self.iter, loss_dict
+                )
+            )
+
+        # Scale loss average over accumulation steps
+        if self.grad_accum_steps > 1:
+            losses = losses / self.grad_accum_steps
+
+        # Backward pass - accumulates gradients
+        losses.backward()
+
+        # === Log metrics ===
+        # Reduce losses across devices for logging. Log every iteration.
+        loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
+        # Calculate the total loss reduced across devices. If accumulating, use the scaled loss.
+        total_loss_reduced = sum(loss for loss in loss_dict_reduced.values())
+        if self.grad_accum_steps > 1:
+            total_loss_reduced = total_loss_reduced / self.grad_accum_steps
+
+        if comm.is_main_process():
+            storage.put_scalar("data_time", data_time)
+            # Log the total loss (potentially scaled if accumulating)
+            storage.put_scalar("total_loss", total_loss_reduced)
+            # Log individual loss components (unscaled) if available
+            if len(loss_dict_reduced) > 1:
+                storage.put_scalars(**loss_dict_reduced)
+        # ==================
+
+        # === Hooks: after_backward ===
+        self._call_hooks("after_backward")
+        # =============================
+
+        # Optimizer step and gradient zeroing (conditional)
+        # Perform step only after accumulating gradients for grad_accum_steps
+        if (self.iter + 1) % self.grad_accum_steps == 0:
+            # === Hooks: before_optimizer_step ===
+            self._call_hooks("before_optimizer_step")
+            # ====================================
+
+            self.optimizer.step()
+
+            # Zero gradients *after* stepping, ready for the next accumulation cycle
+            self.optimizer.zero_grad()
+
+        # === Hooks: after_step ===
+        # Called after each iteration, regardless of whether an optimizer step was performed.
+        self._call_hooks("after_step")
+        # =========================
+
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -58,12 +163,12 @@ class Trainer(DefaultTrainer):
             evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
         if evaluator_type == "cityscapes_instance":
             assert (
-                torch.cuda.device_count() >= comm.get_rank()
+                    torch.cuda.device_count() >= comm.get_rank() # type: ignore
             ), "CityscapesEvaluator currently do not work with multiple machines."
             return CityscapesInstanceEvaluator(dataset_name)
         if evaluator_type == "cityscapes_sem_seg":
             assert (
-                torch.cuda.device_count() >= comm.get_rank()
+                    torch.cuda.device_count() >= comm.get_rank() # type: ignore
             ), "CityscapesEvaluator currently do not work with multiple machines."
             return CityscapesSemSegEvaluator(dataset_name)
         elif evaluator_type == "pascal_voc":
@@ -106,15 +211,15 @@ class Trainer(DefaultTrainer):
             # detectron2 doesn't have full  model gradient clipping now
             clip_norm_val = cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE
             enable = (
-                cfg.SOLVER.CLIP_GRADIENTS.ENABLED
-                and cfg.SOLVER.CLIP_GRADIENTS.CLIP_TYPE == "full_model"
-                and clip_norm_val > 0.0
+                    cfg.SOLVER.CLIP_GRADIENTS.ENABLED
+                    and cfg.SOLVER.CLIP_GRADIENTS.CLIP_TYPE == "full_model"
+                    and clip_norm_val > 0.0
             )
 
             class FullModelGradientClippingOptimizer(optim):
                 def step(self, closure=None):
                     all_params = itertools.chain(*[x["params"] for x in self.param_groups])
-                    torch.nn.utils.clip_grad_norm_(all_params, clip_norm_val)
+                    torch.nn.utils.clip_grad_norm_(all_params, clip_norm_val) # type: ignore
                     super().step(closure=closure)
 
             return FullModelGradientClippingOptimizer if enable else optim
@@ -140,7 +245,11 @@ class Trainer(DefaultTrainer):
             from sparseinst import SparseInstDatasetMapper
             mapper = SparseInstDatasetMapper(cfg, is_train=True)
         else:
-            mapper = None
+            # Keep the original behavior if no specific mapper is set
+            mapper = DatasetMapper(cfg, is_train=True) if cfg.INPUT.CUSTOM_AUG == '' else \
+                build_detection_train_loader(cfg).dataset.dataset._map_func # Fallback logic might vary
+            # Or simply:
+            # mapper = None # If default build_detection_train_loader handles mapper internally
         return build_detection_train_loader(cfg, mapper=mapper)
 
 

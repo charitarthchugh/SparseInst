@@ -46,6 +46,7 @@ _darcs
 !/datasets/*.*
 /projects/*/datasets
 /models
+wandb/*
 
 # mac file
 .DS_Store

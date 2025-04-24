@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from scipy.optimize import linear_sum_assignment
 from fvcore.nn import sigmoid_focal_loss_jit
 
@@ -286,7 +286,7 @@ class SparseInstMatcher(nn.Module):
 
             pred_masks = pred_masks.view(B * N, -1)
             tgt_masks = tgt_masks.flatten(1)
-            with autocast(enabled=False):
+            with autocast("cuda",enabled=False):
                 pred_masks = pred_masks.float()
                 tgt_masks = tgt_masks.float()
                 pred_logits = pred_logits.float()

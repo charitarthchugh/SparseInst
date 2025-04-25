@@ -32,21 +32,72 @@ from sparseinst import add_sparse_inst_config, COCOMaskEvaluator
 import time # Make sure this import is present
 from detectron2.utils.events import get_event_storage # Make sure this import is present
 
-class Trainer(DefaultTrainer):
+class GradientAccumulationAwareLRScheduler(hooks.LRScheduler):
+    """
+    A custom LRScheduler hook that works with gradient accumulation.
+    Only steps the learning rate scheduler after optimizer steps.
+    """
+    def __init__(self, optimizer=None, scheduler=None, grad_accum_steps=1):
+        super().__init__(optimizer, scheduler)
+        self.grad_accum_steps = grad_accum_steps
+        # The trainer attribute will be set when the hook is registered with trainer
 
+    def after_step(self):
+        """Override the after_step to only step scheduler when optimizer steps."""
+        # Safely access trainer and storage
+        if not hasattr(self, "trainer") or self.trainer is None:
+            return
+
+        # Get the storage safely
+        storage = get_event_storage()
+
+        # Always log the LR
+        lr = self._optimizer.param_groups[self._best_param_group_id]["lr"]
+        storage.put_scalar("lr", lr, smoothing_hint=False)
+
+        # Only step the scheduler when optimizer steps (every grad_accum_steps iterations)
+        if (self.trainer.iter + 1) % self.grad_accum_steps == 0:
+            self.scheduler.step()
+
+
+class Trainer(DefaultTrainer):
     def __init__(self, cfg):
         """
         Args:
             cfg (CfgNode):
         """
+        # Call the parent initializer first to set up model, optimizer, data_loader, etc.
         super().__init__(cfg)
+
+        # Explicitly create the data loader iterator after initialization
+        self._data_loader_iter = iter(self.data_loader)
+
         # Get gradient accumulation steps from config, default to 1 (no accumulation)
-        self.grad_accum_steps = cfg.SOLVER.get('GRADIENT_ACCUMULATION_STEPS', 1)
+        self.grad_accum_steps = cfg.SOLVER.GRADIENT_ACCUMULATION_STEPS
+
         if self.grad_accum_steps > 1:
             # Ensure gradients are zeroed before the first training iteration
             self.optimizer.zero_grad()
+
+            # Replace the standard LRScheduler hook with our custom one
+            # Find and replace the LRScheduler hook directly in the _hooks list
+            for i, hook in enumerate(self._hooks):
+                if isinstance(hook, hooks.LRScheduler):
+                    # Create our custom hook
+                    custom_hook = GradientAccumulationAwareLRScheduler(
+                        hook._optimizer, hook.scheduler, self.grad_accum_steps
+                    )
+
+                    # Set the trainer attribute manually
+                    custom_hook.trainer = self
+
+                    # Replace in the hooks list
+                    self._hooks[i] = custom_hook
+                    break
+
             if comm.is_main_process():
                 print(f"Gradient accumulation enabled: Will accumulate gradients over {self.grad_accum_steps} steps.")
+
 
     def _call_hooks(self, hook_name):
         """
@@ -56,7 +107,7 @@ class Trainer(DefaultTrainer):
             # Use getattr to call the hook method if it exists
             hook_method = getattr(h, hook_name, None)
             if callable(hook_method):
-                hook_method(self) # Pass trainer instance to hook method
+                hook_method() # Pass trainer instance to hook method
 
     def run_step(self):
         """
@@ -67,21 +118,18 @@ class Trainer(DefaultTrainer):
         start = time.perf_counter()
 
         # Get data
-        data = next(self._data_loader_iter)
-        data_time = time.perf_counter() - start
+        try:
+            data = next(self._data_loader_iter)
+        except StopIteration:
+            self._data_loader_iter = iter(self.data_loader) # Reset iterator
+            data = next(self._data_loader_iter)
 
-        # === Hooks: before_step ===
-        storage = get_event_storage()
-        # Ensure storage iteration is aligned with trainer iteration
-        storage.iter = self.iter
-        self._call_hooks("before_step")
-        # ==========================
+        data_time = time.perf_counter() - start
 
         # Forward pass
         loss_dict = self.model(data)
         losses = sum(loss_dict.values())
 
-        # Check for invalid losses
         if not torch.isfinite(losses):
             raise FloatingPointError(
                 "Loss became infinite or NaN at iteration={}!\nLosses: {}".format(
@@ -89,52 +137,58 @@ class Trainer(DefaultTrainer):
                 )
             )
 
-        # Scale loss average over accumulation steps
+        # Scale loss for accumulation
         if self.grad_accum_steps > 1:
             losses = losses / self.grad_accum_steps
 
-        # Backward pass - accumulates gradients
+        # Backward pass
         losses.backward()
 
-        # === Log metrics ===
-        # Reduce losses across devices for logging. Log every iteration.
+        # Log metrics (consider logging only when optimizer steps for clarity)
+        storage = get_event_storage()
         loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
-        # Calculate the total loss reduced across devices. If accumulating, use the scaled loss.
         total_loss_reduced = sum(loss for loss in loss_dict_reduced.values())
-        if self.grad_accum_steps > 1:
-            total_loss_reduced = total_loss_reduced / self.grad_accum_steps
+        logged_total_loss = total_loss_reduced # Log the possibly scaled loss
 
         if comm.is_main_process():
-            storage.put_scalar("data_time", data_time)
-            # Log the total loss (potentially scaled if accumulating)
-            storage.put_scalar("total_loss", total_loss_reduced)
-            # Log individual loss components (unscaled) if available
+            storage.put_scalar("data_time", data_time, smoothing_hint=False)
+            storage.put_scalar("total_loss", logged_total_loss)
             if len(loss_dict_reduced) > 1:
                 storage.put_scalars(**loss_dict_reduced)
-        # ==================
 
-        # === Hooks: after_backward ===
+        # Hooks: after_backward
         self._call_hooks("after_backward")
-        # =============================
 
-        # Optimizer step and gradient zeroing (conditional)
-        # Perform step only after accumulating gradients for grad_accum_steps
+        # Optimizer step, scheduler step, and gradient zeroing (conditional)
         if (self.iter + 1) % self.grad_accum_steps == 0:
-            # === Hooks: before_optimizer_step ===
+            # Hooks: before_optimizer_step
             self._call_hooks("before_optimizer_step")
-            # ====================================
 
-            self.optimizer.step()
+            # Get the optimizer from self._trainer (SimpleTrainer)
+            optimizer = self._trainer.optimizer
+            optimizer.step()
 
-            # Zero gradients *after* stepping, ready for the next accumulation cycle
-            self.optimizer.zero_grad()
+            # Step the scheduler manually
+            if self.scheduler is not None:
+                self.scheduler.step()
 
-        # === Hooks: after_step ===
-        # Called after each iteration, regardless of whether an optimizer step was performed.
-        self._call_hooks("after_step")
-        # =========================
+            # Zero gradients after stepping
+            optimizer.zero_grad()
 
+            # Log LR after scheduler step
+            if comm.is_main_process() and self.scheduler is not None:
+                # Find the best param group to log the LR
+                best_param_group_id = 0  # Default to first group
 
+                # Try to find the LRScheduler hook to get the best param group ID
+                for hook in self._hooks:
+                    if isinstance(hook, hooks.LRScheduler):
+                        best_param_group_id = hook._best_param_group_id
+                        break
+
+                # Get and log the LR
+                lr = optimizer.param_groups[best_param_group_id]["lr"]
+                storage.put_scalar("lr", lr, smoothing_hint=False)
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
         """

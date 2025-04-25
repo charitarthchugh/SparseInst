@@ -3,25 +3,30 @@ import sys
 import itertools
 from typing import Any, Dict, List, Set
 import torch
+import wandb
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.utils.logger import setup_logger
 from detectron2.data import MetadataCatalog, build_detection_train_loader, DatasetMapper
-from detectron2.engine import AutogradProfiler, DefaultTrainer, default_argument_parser, default_setup, launch
-from detectron2.evaluation import COCOEvaluator, verify_results
+from detectron2.engine import (
+    DefaultTrainer,
+    default_argument_parser,
+    default_setup,
+    hooks,
+    launch,
+)
+from detectron2.evaluation import verify_results
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
     CityscapesSemSegEvaluator,
-    COCOEvaluator,
     COCOPanopticEvaluator,
     DatasetEvaluators,
     LVISEvaluator,
     PascalVOCDetectionEvaluator,
     SemSegEvaluator,
-    verify_results,
 )
 
 sys.path.append(".")
@@ -32,71 +37,40 @@ from sparseinst import add_sparse_inst_config, COCOMaskEvaluator
 import time # Make sure this import is present
 from detectron2.utils.events import get_event_storage # Make sure this import is present
 
-class GradientAccumulationAwareLRScheduler(hooks.LRScheduler):
-    """
-    A custom LRScheduler hook that works with gradient accumulation.
-    Only steps the learning rate scheduler after optimizer steps.
-    """
-    def __init__(self, optimizer=None, scheduler=None, grad_accum_steps=1):
-        super().__init__(optimizer, scheduler)
-        self.grad_accum_steps = grad_accum_steps
-        # The trainer attribute will be set when the hook is registered with trainer
+class GradAccumLRScheduler(hooks.LRScheduler):
+    def before_train(self):
+        # 1) call base to set _optimizer and _best_param_group_id
+        super().before_train()
+        # 2) do NOT step the scheduler here; just log the initial LR
+        init_lr = self._optimizer.param_groups[self._best_param_group_id]["lr"]
+        get_event_storage().put_scalar("lr", init_lr, smoothing_hint=False)
 
     def after_step(self):
-        """Override the after_step to only step scheduler when optimizer steps."""
-        # Safely access trainer and storage
-        if not hasattr(self, "trainer") or self.trainer is None:
-            return
-
-        # Get the storage safely
-        storage = get_event_storage()
-
-        # Always log the LR
-        lr = self._optimizer.param_groups[self._best_param_group_id]["lr"]
-        storage.put_scalar("lr", lr, smoothing_hint=False)
-
-        # Only step the scheduler when optimizer steps (every grad_accum_steps iterations)
-        if (self.trainer.iter + 1) % self.grad_accum_steps == 0:
-            self.scheduler.step()
-
+        trainer = self.trainer
+        # step every grad_accum_steps
+        if (trainer.iter + 1) % trainer.grad_accum_steps == 0:
+            super().after_step()  # this calls .scheduler.step()
+        # always log the (possibly unchanged) LR
+        curr_lr = self._optimizer.param_groups[self._best_param_group_id]["lr"]
+        get_event_storage().put_scalar("lr", curr_lr, smoothing_hint=False)
 
 class Trainer(DefaultTrainer):
     def __init__(self, cfg):
-        """
-        Args:
-            cfg (CfgNode):
-        """
-        # Call the parent initializer first to set up model, optimizer, data_loader, etc.
         super().__init__(cfg)
-
-        # Explicitly create the data loader iterator after initialization
         self._data_loader_iter = iter(self.data_loader)
-
-        # Get gradient accumulation steps from config, default to 1 (no accumulation)
         self.grad_accum_steps = cfg.SOLVER.GRADIENT_ACCUMULATION_STEPS
-
+        # zero once so the first backward has a clean slate
+        self.optimizer.zero_grad()
+        # replace the default LR scheduler hook
         if self.grad_accum_steps > 1:
-            # Ensure gradients are zeroed before the first training iteration
-            self.optimizer.zero_grad()
-
-            # Replace the standard LRScheduler hook with our custom one
-            # Find and replace the LRScheduler hook directly in the _hooks list
-            for i, hook in enumerate(self._hooks):
-                if isinstance(hook, hooks.LRScheduler):
-                    # Create our custom hook
-                    custom_hook = GradientAccumulationAwareLRScheduler(
-                        hook._optimizer, hook.scheduler, self.grad_accum_steps
-                    )
-
-                    # Set the trainer attribute manually
-                    custom_hook.trainer = self
-
-                    # Replace in the hooks list
-                    self._hooks[i] = custom_hook
+            for i, h in enumerate(self._hooks):
+                if isinstance(h, hooks.LRScheduler):
+                    new_hook = GradAccumLRScheduler(self.optimizer, h.scheduler)
+                    new_hook.trainer = self
+                    self._hooks[i] = new_hook
                     break
-
             if comm.is_main_process():
-                print(f"Gradient accumulation enabled: Will accumulate gradients over {self.grad_accum_steps} steps.")
+                print(f"Using gradient accumulation: {self.grad_accum_steps} steps")
 
 
     def _call_hooks(self, hook_name):
@@ -108,87 +82,27 @@ class Trainer(DefaultTrainer):
             hook_method = getattr(h, hook_name, None)
             if callable(hook_method):
                 hook_method() # Pass trainer instance to hook method
-
     def run_step(self):
-        """
-        Implement the standard training logic with gradient accumulation.
-        Overrides DefaultTrainer.run_step.
-        """
-        assert self.model.training, "[Trainer] model was changed to eval mode!"
-        start = time.perf_counter()
-
-        # Get data
-        try:
-            data = next(self._data_loader_iter)
-        except StopIteration:
-            self._data_loader_iter = iter(self.data_loader) # Reset iterator
-            data = next(self._data_loader_iter)
-
-        data_time = time.perf_counter() - start
-
-        # Forward pass
+        # --------- forward and backward ---------
+        data = next(self._data_loader_iter)
         loss_dict = self.model(data)
         losses = sum(loss_dict.values())
-
         if not torch.isfinite(losses):
-            raise FloatingPointError(
-                "Loss became infinite or NaN at iteration={}!\nLosses: {}".format(
-                    self.iter, loss_dict
-                )
-            )
-
-        # Scale loss for accumulation
+            raise FloatingPointError(f"Non-finite loss at iter={self.iter}: {loss_dict}")
         if self.grad_accum_steps > 1:
             losses = losses / self.grad_accum_steps
-
-        # Backward pass
         losses.backward()
 
-        # Log metrics (consider logging only when optimizer steps for clarity)
-        storage = get_event_storage()
-        loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
-        total_loss_reduced = sum(loss for loss in loss_dict_reduced.values())
-        logged_total_loss = total_loss_reduced # Log the possibly scaled loss
-
-        if comm.is_main_process():
-            storage.put_scalar("data_time", data_time, smoothing_hint=False)
-            storage.put_scalar("total_loss", logged_total_loss)
-            if len(loss_dict_reduced) > 1:
-                storage.put_scalars(**loss_dict_reduced)
-
-        # Hooks: after_backward
+        # fire after_backward hooks
         self._call_hooks("after_backward")
 
-        # Optimizer step, scheduler step, and gradient zeroing (conditional)
+        # --------- optimizer step on Nth mini-batch ----------
         if (self.iter + 1) % self.grad_accum_steps == 0:
-            # Hooks: before_optimizer_step
             self._call_hooks("before_optimizer_step")
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self._call_hooks("after_optimizer_step")  # optional
 
-            # Get the optimizer from self._trainer (SimpleTrainer)
-            optimizer = self._trainer.optimizer
-            optimizer.step()
-
-            # Step the scheduler manually
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-            # Zero gradients after stepping
-            optimizer.zero_grad()
-
-            # Log LR after scheduler step
-            if comm.is_main_process() and self.scheduler is not None:
-                # Find the best param group to log the LR
-                best_param_group_id = 0  # Default to first group
-
-                # Try to find the LRScheduler hook to get the best param group ID
-                for hook in self._hooks:
-                    if isinstance(hook, hooks.LRScheduler):
-                        best_param_group_id = hook._best_param_group_id
-                        break
-
-                # Get and log the LR
-                lr = optimizer.param_groups[best_param_group_id]["lr"]
-                storage.put_scalar("lr", lr, smoothing_hint=False)
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
         """
@@ -331,14 +245,16 @@ def main(args):
         # Make sure to set your project name and optionally entity
         # Remove project and entity args if you want to use defaults or environment variables
         run = wandb.init(
-            project="your-detectron2-project",  # Replace with your project name
-            # entity="your-wandb-entity",    # Optional: replace with your W&B entity (username or team)
+            project="sparseinst",  # Replace it with your project name
+            entity="dsdc",    # Optional: replace with your W&B entity (username or team)
             sync_tensorboard=True,       # Auto-sync TensorBoard metrics
             config=cfg,                  # Log Detectron2 config
             name=f"run-{cfg.OUTPUT_DIR.split('/')[-1]}", # Optional: set a run name
+            # id="qyz3mdo8",#
             resume="allow",              # Allow resuming runs
-            # group="experiment-group",   # Optional: Group runs together
-            # job_type="training",        # Optional: Categorize the run
+            # group="experiment-group", # Optional: Group runs together
+            job_type="training",        # Optional: Categorize the run
+            save_code=True
         )
         # Optional: Define metrics for better W&B dashboard visualization
         # wandb.define_metric("train/total_loss", summary="min")
@@ -371,7 +287,11 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    parser = default_argument_parser()
+    print("Known arguments:")
+    for action in parser._actions:
+        print(f"  {action.option_strings}")
+    args = parser.parse_args()
     print("Command Line Args:", args)
     # Ensure wandb is disabled in non-main processes launched by detectron2's launch util
     if not comm.is_main_process():

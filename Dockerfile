@@ -1,27 +1,26 @@
-FROM pytorch/pytorch:1.11.0-cuda11.3-cudnn8-devel
-LABEL Service="SparseInstanceActivation"
+FROM nvcr.io/nvidia/cuda:11.0.3-devel-ubuntu20.04
 
-ENV TZ=Europe/Moscow
-ENV DETECTRON_TAG=v0.3
+ENV TZ=US/Eastern
+ENV DETECTRON_TAG=v0.6
+ENV PIP_NO_CACHE_DIR=false
 ARG DEBIAN_FRONTEND=noninteractive
 
-RUN apt-key del 7fa2af80 && \
-    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub && \
-    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu1804/x86_64/7fa2af80.pub
-RUN apt update && apt install vim git g++ python3-tk ffmpeg libsm6 libxext6 -y
-
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir opencv-python opencv-contrib-python scipy
+RUN apt update -y && apt upgrade -y
+RUN apt install software-properties-common -y
+RUN add-apt-repository ppa:deadsnakes/ppa -y
+RUN apt update && apt install build-essential ninja-build vim git g++ ffmpeg libsm6 libxext6 python3.11-full python3.11-dev -y
+RUN python3.11 -m ensurepip
+RUN python3.11 -m pip install --upgrade pip
+RUN python3.11 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && \
+    python3.11 -m pip install opencv-python opencv-contrib-python scipy wandb tensorboard
 
 WORKDIR /workspace
 RUN git clone https://github.com/facebookresearch/detectron2.git && \
-    cd detectron2/ && git checkout tags/${DETECTRON_TAG} && python3 setup.py build develop
+    cd detectron2/ && git checkout tags/${DETECTRON_TAG} && python3.11 setup.py build develop
 
-RUN python3 -m pip uninstall -y iopath fvcore portalocker yacs && \
-    python3 -m pip install --no-cache-dir iopath fvcore portalocker yacs timm pyyaml==5.1 shapely
+RUN  python3.11 -m pip install iopath fvcore portalocker yacs timm pyyaml==5.1 shapely requests
 
 RUN git clone https://github.com/hustvl/SparseInst
 WORKDIR /workspace/SparseInst
-RUN ln -s /usr/bin/python3 /usr/bin/python
-
+RUN ln -s /usr/bin/python3.11 /usr/bin/python
 ENTRYPOINT bash

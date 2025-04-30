@@ -1,0 +1,24 @@
+_BASE_: "Base-SparseInst.yaml"
+INPUT:
+  CROP:
+    ENABLED: True
+    TYPE: "absolute_range"
+    SIZE: (384, 600)
+  MASK_FORMAT: "polygon"
+MODEL:
+  BACKBONE:
+    NAME: "build_mobilenetv3_backbone"
+  SPARSE_INST:
+    ENCODER:
+      IN_FEATURES: ["res3", "res4", "res5"]
+      IN_CHANNELS: [24,40,112]
+      NUM_CHANNELS: 256
+    DECODER:
+      NAME: "GroupIAMSoftDecoder"
+  MOBILENETV3:
+    ARCH: "mobilenet_v3_large"
+    WIDTH_MULT: 1.0
+    REDUCED_TAIL: False
+    DILATED: False
+    OUT_FEATURES: ["res3", "res4", "res5"]
+OUTPUT_DIR: "output/sparse_inst_mobilenetv3_giam1"

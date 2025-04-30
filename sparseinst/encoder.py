@@ -15,15 +15,13 @@ SPARSE_INST_ENCODER_REGISTRY.__doc__ = "registry for SparseInst decoder"
 
 
 class PyramidPoolingModule(nn.Module):
-
     def __init__(self, in_channels, channels=512, sizes=(1, 2, 3, 6)):
         super().__init__()
         self.stages = []
         self.stages = nn.ModuleList(
             [self._make_stage(in_channels, channels, size) for size in sizes]
         )
-        self.bottleneck = Conv2d(
-            in_channels + len(sizes) * channels, in_channels, 1)
+        self.bottleneck = Conv2d(in_channels + len(sizes) * channels, in_channels, 1)
 
     def _make_stage(self, features, out_features, size):
         prior = nn.AdaptiveAvgPool2d(output_size=(size, size))
@@ -32,27 +30,60 @@ class PyramidPoolingModule(nn.Module):
 
     def forward(self, feats):
         h, w = feats.size(2), feats.size(3)
-        priors = [F.interpolate(input=F.relu_(stage(feats)), size=(
-            h, w), mode='bilinear', align_corners=False) for stage in self.stages] + [feats]
+        priors = [
+            F.interpolate(
+                input=F.relu_(stage(feats)),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            for stage in self.stages
+        ] + [feats]
         out = F.relu_(self.bottleneck(torch.cat(priors, 1)))
         return out
 
 
-
 @SPARSE_INST_ENCODER_REGISTRY.register()
 class InstanceContextEncoder(nn.Module):
-    """ 
+    """
     Instance Context Encoder
     1. construct feature pyramids from ResNet
     2. enlarge receptive fields (ppm)
-    3. multi-scale fusion 
+    3. multi-scale fusion
     """
 
     def __init__(self, cfg, input_shape):
         super().__init__()
         self.num_channels = cfg.MODEL.SPARSE_INST.ENCODER.NUM_CHANNELS
         self.in_features = cfg.MODEL.SPARSE_INST.ENCODER.IN_FEATURES
-        self.in_channels = [input_shape[f].channels for f in self.in_features]
+
+        # Use explicitly specified channel dimensions if available
+        if (
+            hasattr(cfg.MODEL.SPARSE_INST.ENCODER, "IN_CHANNELS")
+            and len(cfg.MODEL.SPARSE_INST.ENCODER.IN_CHANNELS) > 0
+        ):
+            self.in_channels = cfg.MODEL.SPARSE_INST.ENCODER.IN_CHANNELS
+            print(f"Using specified IN_CHANNELS: {self.in_channels}")
+        else:
+            self.in_channels = [input_shape[f].channels for f in self.in_features]
+            print(f"Using detected IN_CHANNELS: {self.in_channels}")
+
+        # Print the actual shape information for debugging
+        print(f"Input shape details: {input_shape}")
+        for f in self.in_features:
+            if f in input_shape:
+                print(
+                    f"Feature {f}: channels={input_shape[f].channels}, stride={input_shape[f].stride}"
+                )
+            else:
+                print(f"Feature {f} not found in input_shape!")
+
+        self.deconv = (
+            cfg.MODEL.SPARSE_INST.ENCODER.DECONV
+            if hasattr(cfg.MODEL.SPARSE_INST.ENCODER, "DECONV")
+            else False
+        )
+
         fpn_laterals = []
         fpn_outputs = []
         for in_channel in reversed(self.in_channels):
@@ -69,21 +100,51 @@ class InstanceContextEncoder(nn.Module):
         # final fusion
         self.fusion = nn.Conv2d(self.num_channels * 3, self.num_channels, 1)
         c2_msra_fill(self.fusion)
+        #
+        # if self.deconv:
+        #     self.decoder = nn.ModuleList()
+        #     for i in range(len(self.in_features) - 1):
+        #         self.decoder.append(
+        #             nn.ConvTranspose2d(self.num_channels, self.num_channels, 2**(i+2), stride=2**(i+1), padding=2**(i+1)//2, output_padding=0)
+        #         )
+        #     for module in self.decoder:
+        #         c2_msra_fill(module)
 
     def forward(self, features):
+        # Debug print for runtime feature dimensions
+        # for f in self.in_features:
+        #     if f in features:
+        #         print(f"Runtime feature {f} shape: {features[f].shape}")
+
         features = [features[f] for f in self.in_features]
         features = features[::-1]
+        # Change x[0] to features[0]
         prev_features = self.ppm(self.fpn_laterals[0](features[0]))
         outputs = [self.fpn_outputs[0](prev_features)]
-        for feature, lat_conv, output_conv in zip(features[1:], self.fpn_laterals[1:], self.fpn_outputs[1:]):
+
+        for feature, lat_conv, output_conv in zip(
+            features[1:], self.fpn_laterals[1:], self.fpn_outputs[1:]
+        ):
             lat_features = lat_conv(feature)
-            top_down_features = F.interpolate(prev_features, scale_factor=2.0, mode='nearest')
+            top_down_features = F.interpolate(
+                prev_features, scale_factor=2.0, mode="nearest"
+            )
             prev_features = lat_features + top_down_features
             outputs.insert(0, output_conv(prev_features))
         size = outputs[0].shape[2:]
-        features = [
-            outputs[0]] + [F.interpolate(x, size, mode='bilinear', align_corners=False) for x in outputs[1:]]
+        features = [outputs[0]] + [
+            F.interpolate(x, size, mode="bilinear", align_corners=False)
+            for x in outputs[1:]
+        ]
         features = self.fusion(torch.cat(features, dim=1))
+
+        # if self.deconv:
+        #     deconv_feat = []
+        #     for i in range(len(self.in_features) - 1):
+        #         deconv_feat.append(self.decoder[i](outputs[i+1]))
+        #     deconv_feat.append(outputs[0])
+        #     features = sum(deconv_feat)
+
         return features
 
 

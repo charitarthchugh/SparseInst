@@ -19,7 +19,9 @@ def add_sparse_inst_config(cfg):
     cfg.MODEL.SPARSE_INST.ENCODER.NAME = "FPNPPMEncoder"
     cfg.MODEL.SPARSE_INST.ENCODER.NORM = ""
     cfg.MODEL.SPARSE_INST.ENCODER.IN_FEATURES = ["res3", "res4", "res5"]
+    cfg.MODEL.SPARSE_INST.ENCODER.IN_CHANNELS = []  # Add this line
     cfg.MODEL.SPARSE_INST.ENCODER.NUM_CHANNELS = 256
+    cfg.MODEL.SPARSE_INST.ENCODER.DECONV = False
 
     # [Decoder]
     cfg.MODEL.SPARSE_INST.DECODER = CN()
@@ -31,7 +33,7 @@ def add_sparse_inst_config(cfg):
     # upsample factor for output masks
     cfg.MODEL.SPARSE_INST.DECODER.SCALE_FACTOR = 2.0
     cfg.MODEL.SPARSE_INST.DECODER.OUTPUT_IAM = False
-    cfg.MODEL.SPARSE_INST.DECODER.GROUPS = 4    
+    cfg.MODEL.SPARSE_INST.DECODER.GROUPS = 4
     # decoder.inst_branch
     cfg.MODEL.SPARSE_INST.DECODER.INST = CN()
     cfg.MODEL.SPARSE_INST.DECODER.INST.DIM = 256
@@ -78,3 +80,9 @@ def add_sparse_inst_config(cfg):
     # (csp-)darknet: csp1, csp2, csp3, csp4
     cfg.MODEL.CSPNET.OUT_FEATURES = ["csp1", "csp2", "csp3", "csp4"]
 
+    cfg.MODEL.MOBILENETV3 = CN()
+    cfg.MODEL.MOBILENETV3.ARCH = "mobilenet_v3_large"  # or "mobilenet_v3_small"
+    cfg.MODEL.MOBILENETV3.WIDTH_MULT = 1.0
+    cfg.MODEL.MOBILENETV3.REDUCED_TAIL = False
+    cfg.MODEL.MOBILENETV3.DILATED = False
+    cfg.MODEL.MOBILENETV3.OUT_FEATURES = []

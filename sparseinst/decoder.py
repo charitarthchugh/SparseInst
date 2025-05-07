@@ -10,7 +10,6 @@ from fvcore.nn.weight_init import c2_msra_fill, c2_xavier_fill
 
 from detectron2.utils.registry import Registry
 from detectron2.layers import Conv2d
-from sparseinst.encoder import SPARSE_INST_ENCODER_REGISTRY
 
 SPARSE_INST_DECODER_REGISTRY = Registry("SPARSE_INST_DECODER")
 SPARSE_INST_DECODER_REGISTRY.__doc__ = "registry for SparseInst decoder"
@@ -61,7 +60,7 @@ class InstanceBranch(nn.Module):
 
         init.normal_(self.mask_kernel.weight, std=0.01)
         init.constant_(self.mask_kernel.bias, 0.0)
-    @torch.compile(mode='max-autotune')
+    @torch.compile(mode='max-autotune-no-cudagraphs')
     def forward(self, features):
         # instance features (x4 convs)
         features = self.inst_convs(features)
@@ -101,7 +100,7 @@ class MaskBranch(nn.Module):
             if isinstance(m, nn.Conv2d):
                 c2_msra_fill(m)
         c2_msra_fill(self.projection)
-    @torch.compile(mode='max-autotune')
+    @torch.compile(mode='max-autotune-no-cudagraphs')
     def forward(self, features):
         # mask features (x4 convs)
         features = self.mask_convs(features)
@@ -145,7 +144,7 @@ class BaseIAMDecoder(nn.Module):
         locations = torch.cat([x_loc, y_loc], 1)
         return locations.to(x)
 
-    @torch.compile(mode='max-autotune')
+    @torch.compile(mode='max-autotune-no-cudagraphs')
     def forward(self, features):
         coord_features = self.compute_coordinates(features)
         features = torch.cat([coord_features, features], dim=1)
@@ -216,7 +215,7 @@ class GroupInstanceBranch(nn.Module):
         init.constant_(self.mask_kernel.bias, 0.0)
         c2_xavier_fill(self.fc)
 
-    @torch.compile(mode='max-autotune')
+    @torch.compile(mode='max-autotune-no-cudagraphs')
     def forward(self, features):
         # instance features (x4 convs)
         features = self.inst_convs(features)
@@ -260,7 +259,7 @@ class GroupInstanceSoftBranch(GroupInstanceBranch):
     def __init__(self, cfg, in_channels):
         super().__init__(cfg, in_channels)
         self.softmax_bias = nn.Parameter(torch.ones([1, ]))
-    @torch.compile(mode='max-autotune')
+    @torch.compile(mode='max-autotune-no-cudagraphs')
     def forward(self, features):
         # instance features (x4 convs)
         features = self.inst_convs(features)

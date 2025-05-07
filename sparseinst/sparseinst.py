@@ -33,6 +33,7 @@ class SparseInst(nn.Module):
 
         # backbone
         self.backbone = build_backbone(cfg)
+        self.backbone = torch.compile(self.backbone, mode="max-autotune-no-cudagraphs", fullgraph=True)
         self.size_divisibility = self.backbone.size_divisibility
         output_shape = self.backbone.output_shape()
 

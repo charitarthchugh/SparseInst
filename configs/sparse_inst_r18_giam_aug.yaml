@@ -1,0 +1,13 @@
+_BASE_: "Base-SparseInst.yaml"
+MODEL:
+  WEIGHTS: "pretrained_models/R-18.pkl" # Or path to your specific ResNet18 weights
+  RESNETS:
+    DEPTH: 18
+    RES2_OUT_CHANNELS: 64
+INPUT:
+  CROP:
+    ENABLED: True
+    TYPE: "absolute_range"
+    SIZE: (384, 600)
+  MASK_FORMAT: "polygon"
+OUTPUT_DIR: "output/sparse_inst_r18_giam_aug"

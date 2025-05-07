@@ -1,6 +1,5 @@
 # Copyright (c) Tianheng Cheng and its affiliates. All Rights Reserved
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +26,7 @@ class PyramidPoolingModule(nn.Module):
         prior = nn.AdaptiveAvgPool2d(output_size=(size, size))
         conv = Conv2d(features, out_features, 1)
         return nn.Sequential(prior, conv)
-
+    @torch.compile(dynamic=True)
     def forward(self, feats):
         h, w = feats.size(2), feats.size(3)
         priors = [
@@ -109,7 +108,7 @@ class InstanceContextEncoder(nn.Module):
         #         )
         #     for module in self.decoder:
         #         c2_msra_fill(module)
-
+    @torch.compile(dynamic=True)
     def forward(self, features):
         # Debug print for runtime feature dimensions
         # for f in self.in_features:

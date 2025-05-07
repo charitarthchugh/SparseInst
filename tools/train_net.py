@@ -288,6 +288,9 @@ def main(args):
 
 if __name__ == "__main__":
     parser = default_argument_parser()
+    torch.set_float32_matmul_precision("high")
+    torch._dynamo.config.cache_size_limit = 32 # or higher
+    torch._dynamo.config.capture_scalar_outputs = True
     print("Known arguments:")
     for action in parser._actions:
         print(f"  {action.option_strings}")
